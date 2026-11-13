@@ -7,6 +7,8 @@
   const waveHeightScale = 2;
   const simulationStep = 1 / 120;
   const pointerSmoothing = 1 - Math.exp(-18 * simulationStep);
+  const touchHoldDelay = 250;
+  const touchMoveThreshold = 8;
   const windDelay = 12;
   const windInterval = 24;
   const windDuration = 10;
@@ -541,6 +543,7 @@ return { resize, stepSimulation, draw };
     hovering: false,
     grab: null,
   };
+  let touchContact = null;
 
   function pointerCoords(event) {
     const rect = canvas.getBoundingClientRect();
@@ -591,52 +594,101 @@ return { resize, stepSimulation, draw };
     grab.height = 0.55 * (-grab.offsetY + Math.abs(grab.offsetX) * 0.2) / (heightProjection * waveHeightScale);
   }
 
-  canvas.addEventListener('pointerenter', (event) => {
-    if (!renderer || !motionEnabled || !event.isPrimary || pointerState.grab?.id != null) return;
-    const { x, y } = pointerCoords(event);
-    resetHover(x, y, true);
-  });
-
-  canvas.addEventListener('pointerdown', (event) => {
-    if (!renderer || !motionEnabled || !event.isPrimary || pointerState.grab?.id != null) return;
-    if (event.pointerType === 'mouse' && event.button !== 0) return;
-    const { x, y } = pointerCoords(event);
-    canvas.setPointerCapture(event.pointerId);
+  function beginGrab(id, x, y) {
     resetHover(x, y, false);
     const grab = {
       ...nearestJunction(x, y),
-      id: event.pointerId, startX: x, startY: y,
+      id, startX: x, startY: y,
       baseRadius: Math.max(65, Math.min(135, canvas.clientWidth / meshDensity(canvas.clientWidth) * 1.35)),
       weight: 1, releasePending: false,
     };
     pullJunction(grab, x, y);
     pointerState.grab = grab;
     canvas.style.cursor = 'grabbing';
+  }
+
+  canvas.addEventListener('pointerenter', (event) => {
+    if (!renderer || !motionEnabled || !event.isPrimary || event.pointerType === 'touch'
+      || touchContact || pointerState.grab?.id != null) return;
+    const { x, y } = pointerCoords(event);
+    resetHover(x, y, true);
+  });
+
+  canvas.addEventListener('pointerdown', (event) => {
+    if (!renderer || !motionEnabled || !event.isPrimary || touchContact || pointerState.grab?.id != null) return;
+    if (event.pointerType === 'mouse' && event.button !== 0) return;
+    const { x, y } = pointerCoords(event);
+    canvas.setPointerCapture(event.pointerId);
+    if (event.pointerType === 'touch') {
+      resetHover(x, y, false);
+      const contact = { id: event.pointerId, x, y, timer: null };
+      contact.timer = setTimeout(() => {
+        contact.timer = null;
+        beginGrab(contact.id, x, y);
+      }, touchHoldDelay);
+      touchContact = contact;
+      return;
+    }
+    beginGrab(event.pointerId, x, y);
   });
 
   canvas.addEventListener('pointermove', (event) => {
     if (!renderer || !motionEnabled || !event.isPrimary) return;
+    if (touchContact ? touchContact.id !== event.pointerId : event.pointerType === 'touch') return;
     const { x, y } = pointerCoords(event);
     const grab = pointerState.grab;
     if (grab?.id != null) {
       if (grab.id === event.pointerId) pullJunction(grab, x, y);
       return;
     }
-    if (event.pointerType === 'touch') return;
-    if (!pointerState.hovering) resetHover(x, y, true);
+    if (touchContact?.timer != null) {
+      if (Math.hypot(x - touchContact.x, y - touchContact.y) < touchMoveThreshold) return;
+      clearTimeout(touchContact.timer);
+      touchContact.timer = null;
+      resetHover(touchContact.x, touchContact.y, true);
+    } else if (!pointerState.hovering) {
+      resetHover(x, y, true);
+    }
     pointerState.targetX = x;
     pointerState.targetY = y;
   });
 
   canvas.addEventListener('pointerleave', (event) => {
-    if (event.isPrimary && pointerState.grab?.id == null) pointerState.hovering = false;
+    if (event.isPrimary && event.pointerType !== 'touch' && !touchContact && pointerState.grab?.id == null) {
+      pointerState.hovering = false;
+    }
+  });
+
+  canvas.addEventListener('contextmenu', (event) => {
+    if (touchContact) event.preventDefault();
   });
 
   function releasePointer(event) {
     const grab = pointerState.grab;
+    const released = event.type === 'pointerup';
+    if (touchContact?.id === event.pointerId) {
+      const contact = touchContact;
+      clearTimeout(contact.timer);
+      touchContact = null;
+      if (grab?.id !== event.pointerId) {
+        if (released) {
+          const { x, y } = pointerCoords(event);
+          if (!pointerState.hovering && Math.hypot(x - contact.x, y - contact.y) >= touchMoveThreshold) {
+            resetHover(contact.x, contact.y, true);
+          }
+          if (pointerState.hovering) {
+            pointerState.targetX = x;
+            pointerState.targetY = y;
+          }
+        } else {
+          pointerState.hovering = false;
+        }
+        return;
+      }
+    }
+
     if (grab?.id !== event.pointerId) return;
     const { x, y } = pointerCoords(event);
-    const released = event.type === 'pointerup';
     if (released) pullJunction(grab, x, y);
     grab.id = null;
     grab.releasePending = released;
@@ -650,7 +702,9 @@ return { resize, stepSimulation, draw };
   canvas.addEventListener('lostpointercapture', releasePointer);
 
   function clearPointer() {
-    const id = pointerState.grab?.id;
+    const id = touchContact?.id ?? pointerState.grab?.id;
+    clearTimeout(touchContact?.timer);
+    touchContact = null;
     pointerState.grab = null;
     pointerState.hovering = false;
     canvas.style.cursor = '';
