@@ -1,6 +1,7 @@
 (() => {
   const canvas = document.querySelector('#drawing');
   const status = document.querySelector('#status');
+  const motionToggle = document.querySelector('#motion-toggle');
   const floorDepthScale = 1 / Math.sqrt(3);
   const heightProjection = Math.sqrt(1 - floorDepthScale * floorDepthScale);
   const waveHeightScale = 2;
@@ -17,8 +18,38 @@
     return Number.isInteger(number) && number >= 1 && number <= 64 ? number : null;
   }
 
-  const n = readDensity(new URLSearchParams(location.search).get('n'))
-    ?? readDensity(canvas.dataset.n) ?? 24;
+  const requestedDensity = readDensity(new URLSearchParams(location.search).get('n'));
+  const defaultDensity = readDensity(canvas.dataset.n) ?? 24;
+
+  function meshDensity(width) {
+    return requestedDensity ?? Math.min(defaultDensity, Math.max(1, Math.floor(width / 10)));
+  }
+
+  // RGBA8 uses two bytes each for signed height and velocity.
+  const packedWave = `
+    precision highp float;
+
+    float decodeWaveValue(vec2 bytes) {
+      return (dot(bytes, vec2(65280.0, 255.0)) - 32768.0) / 200.0;
+    }
+
+    vec2 encodeWaveValue(float value) {
+      float code = clamp(floor(value * 200.0 + 32768.5), 0.0, 65535.0);
+      float highByte = floor(code / 256.0);
+      return vec2(highByte, code - highByte * 256.0) / 255.0;
+    }
+  `;
+
+  const waveTexture = `
+    vec2 readWave(highp sampler2D wave, ivec2 pixel, ivec2 lastPixel) {
+      vec4 sampleValue = texelFetch(wave, clamp(pixel, ivec2(0), lastPixel), 0);
+      #ifdef PACKED_WAVE
+        return vec2(decodeWaveValue(sampleValue.rg), decodeWaveValue(sampleValue.ba));
+      #else
+        return sampleValue.rg;
+      #endif
+    }
+  `;
 
   // 1. 波動シミュレーション用シェーダー（FBOピンポン）
   // R: 現在の高さ, G: 速度
@@ -36,8 +67,7 @@
     in vec2 v_uv;
     out vec4 outColor;
 
-    uniform sampler2D u_prev;
-    uniform vec2 u_texelSize;
+    uniform highp sampler2D u_prev;
     uniform vec2 u_floorSize;
     uniform vec2 u_pointerPos;     // 現在のフロア座標
     uniform vec2 u_prevPointerPos; // 前フレームのフロア座標
@@ -46,6 +76,7 @@
     uniform float u_grabHeight;    // つまみ上げている高さ
     uniform float u_grabRadius;
     uniform float u_damping;
+    ${waveTexture}
 
     // 線分と点の最短距離（滑らかな航跡を作るため）
     float distToSegment(vec2 p, vec2 a, vec2 b) {
@@ -55,17 +86,19 @@
     }
 
     void main() {
-      vec2 data = texture(u_prev, v_uv).rg;
+      ivec2 pixel = ivec2(gl_FragCoord.xy);
+      ivec2 lastPixel = textureSize(u_prev, 0) - 1;
+      vec2 data = readWave(u_prev, pixel, lastPixel);
       float h = data.r;
       float v = data.g;
 
       // 上下左右のサンプリング（境界は反射条件）
-      vec2 dx = vec2(u_texelSize.x, 0.0);
-      vec2 dy = vec2(0.0, u_texelSize.y);
-      float hL = texture(u_prev, clamp(v_uv - dx, 0.0, 1.0)).r;
-      float hR = texture(u_prev, clamp(v_uv + dx, 0.0, 1.0)).r;
-      float hD = texture(u_prev, clamp(v_uv - dy, 0.0, 1.0)).r;
-      float hU = texture(u_prev, clamp(v_uv + dy, 0.0, 1.0)).r;
+      ivec2 dx = ivec2(1, 0);
+      ivec2 dy = ivec2(0, 1);
+      float hL = readWave(u_prev, pixel - dx, lastPixel).x;
+      float hR = readWave(u_prev, pixel + dx, lastPixel).x;
+      float hD = readWave(u_prev, pixel - dy, lastPixel).x;
+      float hU = readWave(u_prev, pixel + dy, lastPixel).x;
 
       // 2次元波動方程式（ラプラシアンによる加速度）
       float laplacian = (hL + hR + hD + hU) - 4.0 * h;
@@ -96,7 +129,11 @@
 
       // 発散防止のクランプ
       h = clamp(h + v, -150.0, 150.0);
-      outColor = vec4(h, v, 0.0, 1.0);
+      #ifdef PACKED_WAVE
+        outColor = vec4(encodeWaveValue(h), encodeWaveValue(v));
+      #else
+        outColor = vec4(h, v, 0.0, 1.0);
+      #endif
     }
   `;
 
@@ -106,10 +143,11 @@
     uniform float u_edgeLength;
     uniform float u_motion;
     uniform vec3 u_wind;
-    uniform sampler2D u_waveTex;
+    uniform highp sampler2D u_waveTex;
     uniform vec2 u_waveTexelSize;
     uniform vec4 u_grab;      // xy: 交点の元の位置, zw: 引っ張り量
     uniform vec2 u_grabShape; // x: 影響半径, y: つまみの強さ
+    ${waveTexture}
 
     const float waveWidthScale = 2.0;
     const float waveHeightScale = ${waveHeightScale.toFixed(1)};
@@ -149,12 +187,25 @@
 
       // GPGPUテクスチャから高さと勾配（Slope）を取得
       vec2 uv = clamp(floorPosition / floorSize, 0.0, 1.0);
-      float hC = texture(u_waveTex, uv).r;
-      float hR = texture(u_waveTex, uv + vec2(u_waveTexelSize.x, 0.0)).r;
-      float hU = texture(u_waveTex, uv + vec2(0.0, u_waveTexelSize.y)).r;
-
       vec2 cellFloorSize = floorSize * u_waveTexelSize;
-      vec2 grad = vec2((hR - hC) / cellFloorSize.x, (hU - hC) / cellFloorSize.y);
+      #ifdef PACKED_WAVE
+        vec2 samplePixel = uv / u_waveTexelSize - 0.5;
+        ivec2 pixel = ivec2(floor(samplePixel));
+        ivec2 lastPixel = textureSize(u_waveTex, 0) - 1;
+        vec2 weight = fract(samplePixel);
+        float h00 = readWave(u_waveTex, pixel, lastPixel).x;
+        float h10 = readWave(u_waveTex, pixel + ivec2(1, 0), lastPixel).x;
+        float h01 = readWave(u_waveTex, pixel + ivec2(0, 1), lastPixel).x;
+        float h11 = readWave(u_waveTex, pixel + ivec2(1, 1), lastPixel).x;
+        float hC = mix(mix(h00, h10, weight.x), mix(h01, h11, weight.x), weight.y);
+        vec2 grad = vec2(mix(h10 - h00, h11 - h01, weight.y),
+                         mix(h01 - h00, h11 - h10, weight.x)) / cellFloorSize;
+      #else
+        float hC = texture(u_waveTex, uv).r;
+        float hR = texture(u_waveTex, uv + vec2(u_waveTexelSize.x, 0.0)).r;
+        float hU = texture(u_waveTex, uv + vec2(0.0, u_waveTexelSize.y)).r;
+        vec2 grad = vec2(hR - hC, hU - hC) / cellFloorSize;
+      #endif
       float waveSlope = dot(grad, floorDirection);
 
       float windAmplitude = min(u_edgeLength * 0.14, 7.0);
@@ -266,7 +317,8 @@
   }
 
   function createMesh(width, height) {
-    const columnWidth = width / n;
+    const density = meshDensity(width);
+    const columnWidth = width / density;
     const halfWidth = columnWidth / 2;
     const rowHeight = halfWidth * floorDepthScale;
     const rowLimit = Math.ceil(height / (2 * rowHeight)) + 1;
@@ -274,7 +326,7 @@
     const points = [];
     const strip = [];
     // 波が急峻になるため分割数を少し増やして曲線を滑らかに保つ
-    const segments = Math.max(8, Math.min(24, Math.ceil(halfWidth / 1.5)));
+    const segments = Math.max(4, Math.min(24, Math.ceil(halfWidth / 1.5)));
 
     for (let segment = 0; segment <= segments; segment++) {
       const along = segment / segments;
@@ -288,7 +340,7 @@
       const stagger = staggered ? halfWidth : 0;
       const nextStagger = halfWidth - stagger;
 
-      for (let column = -1; column <= n; column++) {
+      for (let column = -1; column <= density; column++) {
         const x = column * columnWidth + stagger;
         points.push(x, y);
         if (row < rowLimit) {
@@ -307,36 +359,70 @@ edgeLength: Math.hypot(halfWidth, rowHeight),
 pointRadius: Math.max(1, Math.min(2.45, halfWidth * 0.065)),
 };
 }
-function createFBO(gl, width, height) {
-const tex = gl.createTexture();
-gl.bindTexture(gl.TEXTURE_2D, tex);
-gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA16F, width, height, 0, gl.RGBA, gl.HALF_FLOAT, null);
-gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-const fbo = gl.createFramebuffer();
-gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
-gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
-if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) {
-  throw new Error('波の計算に必要なフレームバッファーを作成できませんでした。');
-}
-gl.clearColor(0, 0, 0, 0);
-gl.clear(gl.COLOR_BUFFER_BIT);
-gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-return { tex, fbo };
-}
+  function createFBO(gl, width, height, packed) {
+    const tex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    const format = packed ? gl.RGBA8 : gl.RGBA16F;
+    const type = packed ? gl.UNSIGNED_BYTE : gl.HALF_FLOAT;
+    gl.texImage2D(gl.TEXTURE_2D, 0, format, width, height, 0, gl.RGBA, type, null);
+    const filter = packed ? gl.NEAREST : gl.LINEAR;
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filter);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filter);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    const fbo = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+    const complete = gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE;
+    if (complete) {
+      const zero = packed ? 128 / 255 : 0;
+      if (packed) gl.disable(gl.DITHER);
+      gl.clearColor(zero, 0, zero, 0);
+      gl.clear(gl.COLOR_BUFFER_BIT);
+      if (packed) gl.enable(gl.DITHER);
+    }
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    if (complete) return { tex, fbo };
+    gl.deleteFramebuffer(fbo);
+    gl.deleteTexture(tex);
+    return null;
+  }
+
+  function createWaveBuffers(gl, width, height) {
+    const supportsFloat = gl.getExtension('EXT_color_buffer_float')
+      || gl.getExtension('EXT_color_buffer_half_float');
+    for (const packed of supportsFloat ? [false, true] : [true]) {
+      const buffers = [];
+      for (let index = 0; index < 2; index++) {
+        const buffer = createFBO(gl, width, height, packed);
+        if (!buffer) break;
+        buffers.push(buffer);
+      }
+      if (buffers.length === 2) return { buffers, packed };
+      for (const { tex, fbo } of buffers) {
+        gl.deleteFramebuffer(fbo);
+        gl.deleteTexture(tex);
+      }
+    }
+    throw new Error('波の計算に必要なフレームバッファーを作成できませんでした。');
+  }
+
+  function waveShader(source, packed) {
+    return packed ? source.replace('#version 300 es', '#version 300 es\n#define PACKED_WAVE\n' + packedWave) : source;
+  }
+
 function createRenderer(gl) {
-// 浮動小数点テクスチャへの描画拡張を有効化
-gl.getExtension('EXT_color_buffer_float') || gl.getExtension('EXT_color_buffer_half_float');
+const simW = 256;
+const simH = 256;
+const { buffers: fbos, packed } = createWaveBuffers(gl, simW, simH);
 const simUniforms = [
-'u_prev', 'u_texelSize', 'u_floorSize', 'u_pointerPos',
+'u_prev', 'u_floorSize', 'u_pointerPos',
 'u_prevPointerPos', 'u_pointerSpeed', 'u_grabMode', 'u_grabHeight', 'u_grabRadius', 'u_damping'
 ];
-const sim = createProgram(gl, simVertex, simFragment, simUniforms);
+const sim = createProgram(gl, simVertex, waveShader(simFragment, packed), simUniforms);
 const surfaceUniforms = ['u_size', 'u_edgeLength', 'u_motion', 'u_wind', 'u_waveTex', 'u_waveTexelSize', 'u_grab', 'u_grabShape'];
-const lines = createProgram(gl, lineVertex, lineFragment, surfaceUniforms);
-const points = createProgram(gl, pointVertex, pointFragment, [...surfaceUniforms, 'u_pointSize', 'u_radius']);
+const lines = createProgram(gl, waveShader(lineVertex, packed), lineFragment, surfaceUniforms);
+const points = createProgram(gl, waveShader(pointVertex, packed), pointFragment, [...surfaceUniforms, 'u_pointSize', 'u_radius']);
 // シミュレーション用フルスクリーンクワッド
 const quadVAO = gl.createVertexArray();
 gl.bindVertexArray(quadVAO);
@@ -349,10 +435,6 @@ const edgeBuffer = createAttribute(gl, 1, 4, 1);
 const pointGeometry = gl.createVertexArray();
 gl.bindVertexArray(pointGeometry);
 const pointBuffer = createAttribute(gl, 0, 2);
-// シミュレーション解像度（軽量かつ滑らかな256x256）
-const simW = 256;
-const simH = 256;
-const fbos = [createFBO(gl, simW, simH), createFBO(gl, simW, simH)];
 let ping = 0;
 let width = 1, height = 1, floorWidth = 1, floorHeight = 1;
 let stripCount, edgeCount, pointCount;
@@ -390,11 +472,11 @@ const next = 1 - ping;
 gl.bindFramebuffer(gl.FRAMEBUFFER, fbos[next].fbo);
 gl.viewport(0, 0, simW, simH);
 gl.disable(gl.BLEND);
+if (packed) gl.disable(gl.DITHER);
 gl.useProgram(sim.program);
 gl.activeTexture(gl.TEXTURE0);
 gl.bindTexture(gl.TEXTURE_2D, fbos[ping].tex);
 gl.uniform1i(sim.uniforms.u_prev, 0);
-gl.uniform2f(sim.uniforms.u_texelSize, 1 / simW, 1 / simH);
 gl.uniform2f(sim.uniforms.u_floorSize, floorWidth, floorHeight);
 const grab = pointerState.grab;
 const grabMode = grab?.id != null ? 1 : grab?.releasePending ? 2 : 0;
@@ -409,6 +491,7 @@ gl.uniform1f(sim.uniforms.u_grabRadius, grabMode ? Math.min(grab.radius * 0.75, 
 gl.uniform1f(sim.uniforms.u_damping, 0.986); // 波の余韻の長さ（0.98〜0.992で調整可）
 gl.bindVertexArray(quadVAO);
 gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+if (packed) gl.enable(gl.DITHER);
 gl.bindFramebuffer(gl.FRAMEBUFFER, null);
 ping = next;
 if (grabMode === 2) grab.releasePending = false;
@@ -474,7 +557,7 @@ return { resize, stepSimulation, draw };
   function nearestJunction(x, y) {
     const width = canvas.clientWidth;
     const height = canvas.clientHeight;
-    const columnWidth = width / n;
+    const columnWidth = width / meshDensity(width);
     const rowHeight = columnWidth * 0.5 * floorDepthScale;
     const centerRow = Math.round((y - height / 2) / rowHeight);
     let nearest = { x: width / 2, y: height / 2 };
@@ -515,14 +598,15 @@ return { resize, stepSimulation, draw };
   });
 
   canvas.addEventListener('pointerdown', (event) => {
-    if (!renderer || !motionEnabled || !event.isPrimary || event.button !== 0 || pointerState.grab?.id != null) return;
+    if (!renderer || !motionEnabled || !event.isPrimary || pointerState.grab?.id != null) return;
+    if (event.pointerType === 'mouse' && event.button !== 0) return;
     const { x, y } = pointerCoords(event);
     canvas.setPointerCapture(event.pointerId);
     resetHover(x, y, false);
     const grab = {
       ...nearestJunction(x, y),
       id: event.pointerId, startX: x, startY: y,
-      baseRadius: Math.max(65, Math.min(135, canvas.clientWidth / n * 1.35)),
+      baseRadius: Math.max(65, Math.min(135, canvas.clientWidth / meshDensity(canvas.clientWidth) * 1.35)),
       weight: 1, releasePending: false,
     };
     pullJunction(grab, x, y);
@@ -538,6 +622,7 @@ return { resize, stepSimulation, draw };
       if (grab.id === event.pointerId) pullJunction(grab, x, y);
       return;
     }
+    if (event.pointerType === 'touch') return;
     if (!pointerState.hovering) resetHover(x, y, true);
     pointerState.targetX = x;
     pointerState.targetY = y;
@@ -618,6 +703,8 @@ return { resize, stepSimulation, draw };
     simulationTime = 0;
     clearPointer();
     canvas.toggleAttribute('data-static', !renderer || !motionEnabled);
+    motionToggle.hidden = !renderer || !reducedMotion.matches;
+    motionToggle.textContent = motionEnabled ? 'ネットの動きを止める' : 'ネットの動きを有効にする';
 
     if (!renderer) return;
     if (motionEnabled) {
@@ -629,6 +716,11 @@ return { resize, stepSimulation, draw };
 
   reducedMotion.addEventListener('change', (event) => {
     motionEnabled = !event.matches;
+    updateMotion();
+  });
+
+  motionToggle.addEventListener('click', () => {
+    motionEnabled = !motionEnabled;
     updateMotion();
   });
 

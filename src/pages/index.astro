@@ -11,6 +11,27 @@ const drawingDescription = '水面のように揺れるひし形のネット';
     {drawingDescription}
   </canvas>
   <p id="status" class="status" role="status" aria-atomic="true"></p>
+  <button id="motion-toggle" type="button" hidden>ネットの動きを有効にする</button>
   <noscript><p class="status">表示するにはJavaScriptを有効にしてください。</p></noscript>
   <script src="../scripts/engine.js"></script>
 </ProjectLayout>
+
+<style>
+  #drawing {
+    touch-action: none;
+    touch-action: pinch-zoom;
+  }
+
+  #motion-toggle {
+    position: relative;
+    z-index: 10;
+    margin-top: 0.75rem;
+    min-height: 44px;
+    padding: 0.5rem 0.75rem;
+    color: #1f1f1f;
+    background: #f3f3f3;
+    border: 1px solid currentColor;
+    font: inherit;
+    pointer-events: auto;
+  }
+</style>
