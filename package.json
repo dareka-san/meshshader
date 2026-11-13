@@ -1,0 +1,16 @@
+{
+  "name": "meshshader",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "astro dev",
+    "build": "astro build",
+    "preview": "astro preview"
+  },
+  "dependencies": {
+    "astro": "7.4.11"
+  },
+  "devDependencies": {
+    "terser": "^5.51.2"
+  }
+}

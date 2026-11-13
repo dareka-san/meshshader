@@ -1,0 +1,16 @@
+---
+import ProjectLayout from '../layouts/ProjectLayout.astro';
+
+const title = 'MESHSHADER';
+const tags = ['WebGL 2', 'GLSL', 'JavaScript'];
+const drawingDescription = '水面のように揺れるひし形のネット';
+---
+
+<ProjectLayout title={title} tags={tags}>
+  <canvas id="drawing" data-n="64" role="img" aria-label={drawingDescription}>
+    {drawingDescription}
+  </canvas>
+  <p id="status" class="status" role="status" aria-atomic="true"></p>
+  <noscript><p class="status">表示するにはJavaScriptを有効にしてください。</p></noscript>
+  <script src="../scripts/engine.js"></script>
+</ProjectLayout>
